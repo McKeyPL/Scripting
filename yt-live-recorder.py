@@ -147,19 +147,19 @@ from datetime import datetime
 from pathlib import Path
 
 DEFAULT_CHECK_INTERVAL = 60
-DEFAULT_OUTPUT_DIR     = "recordings"
-DEFAULT_FORMAT         = "bestvideo+bestaudio/best"
-DEFAULT_MERGE_FORMAT   = "mkv"
-DEFAULT_RETRIES        = 5
+DEFAULT_OUTPUT_DIR = "recordings"
+DEFAULT_FORMAT = "bestvideo+bestaudio/best"
+DEFAULT_MERGE_FORMAT = "mkv"
+DEFAULT_RETRIES = 5
 
 active_recordings: dict = {}
-active_lock  = threading.Lock()
-stop_event   = threading.Event()
-log          = logging.getLogger("yt-recorder")
+active_lock = threading.Lock()
+stop_event = threading.Event()
+log = logging.getLogger("yt-recorder")
 
 
 def setup_logger(log_file=None):
-    fmt      = "%(asctime)s [%(levelname)s] %(message)s"
+    fmt = "%(asctime)s [%(levelname)s] %(message)s"
     handlers = [logging.StreamHandler(sys.stdout)]
     if log_file:
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
@@ -189,9 +189,11 @@ def fetch_live_streams(channel_url, cookies_browser, cookies_file) -> list:
     # Step 1: fetch only IDs from the playlist (fast, without metadata)
     cmd_list = ytdlp_base_cmd(cookies_browser, cookies_file) + [
         "--flat-playlist",
-        "--print", "%(id)s\t%(title)s",
+        "--print",
+        "%(id)s\t%(title)s",
         "--no-warnings",
-        "--playlist-end", "5",   # check at most the 5 newest
+        "--playlist-end",
+        "5",  # check at most the 5 newest
         channel_url,
     ]
     try:
@@ -219,7 +221,8 @@ def fetch_live_streams(channel_url, cookies_browser, cookies_file) -> list:
         url = f"https://www.youtube.com/watch?v={c['id']}"
         cmd_check = ytdlp_base_cmd(cookies_browser, cookies_file) + [
             "--no-download",
-            "--print", "%(live_status)s",
+            "--print",
+            "%(live_status)s",
             "--no-warnings",
             url,
         ]
@@ -236,25 +239,33 @@ def fetch_live_streams(channel_url, cookies_browser, cookies_file) -> list:
 
     return streams
 
-def record_stream(video_id, title, output_dir, fmt, merge_fmt,
-                  retries, cookies_browser, cookies_file):
+
+def record_stream(
+    video_id, title, output_dir, fmt, merge_fmt, retries, cookies_browser, cookies_file
+):
     """Runs in a separate thread and records one live stream to a file."""
-    url        = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"https://www.youtube.com/watch?v={video_id}"
     safe_title = sanitize_filename(title)
-    timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir    = Path(output_dir)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     output_tpl = str(out_dir / f"{timestamp}_{safe_title}_%(id)s.%(ext)s")
 
     cmd = ytdlp_base_cmd(cookies_browser, cookies_file) + [
-        "-f", fmt,
-        "--merge-output-format", merge_fmt,
-        "--retries",          str(retries),
-        "--fragment-retries", str(retries),
-        "--retry-sleep",      "5",
+        "-f",
+        fmt,
+        "--merge-output-format",
+        merge_fmt,
+        "--retries",
+        str(retries),
+        "--fragment-retries",
+        str(retries),
+        "--retry-sleep",
+        "5",
         "--no-warnings",
         "--live-from-start",
-        "-o", output_tpl,
+        "-o",
+        output_tpl,
         url,
     ]
 
@@ -274,7 +285,9 @@ def record_stream(video_id, title, output_dir, fmt, merge_fmt,
         elif stop_event.is_set():
             log.info("[STOP ] Recording stopped: [%s] %s", video_id, title)
         else:
-            log.warning("[WARN ] yt-dlp exit code %d for [%s]", proc.returncode, video_id)
+            log.warning(
+                "[WARN ] yt-dlp exit code %d for [%s]", proc.returncode, video_id
+            )
     except Exception as exc:
         log.error("[ERR  ] [%s]: %s", video_id, exc)
     finally:
@@ -282,8 +295,16 @@ def record_stream(video_id, title, output_dir, fmt, merge_fmt,
             active_recordings.pop(video_id, None)
 
 
-def monitor_loop(channel_url, check_interval, output_dir, fmt, merge_fmt,
-                 retries, cookies_browser, cookies_file):
+def monitor_loop(
+    channel_url,
+    check_interval,
+    output_dir,
+    fmt,
+    merge_fmt,
+    retries,
+    cookies_browser,
+    cookies_file,
+):
     log.info("=" * 60)
     log.info("  yt-live-recorder")
     log.info("  Channel : %s", channel_url)
@@ -304,8 +325,16 @@ def monitor_loop(channel_url, check_interval, output_dir, fmt, merge_fmt,
             if vid not in currently:
                 t = threading.Thread(
                     target=record_stream,
-                    args=(vid, stream["title"], output_dir, fmt, merge_fmt,
-                          retries, cookies_browser, cookies_file),
+                    args=(
+                        vid,
+                        stream["title"],
+                        output_dir,
+                        fmt,
+                        merge_fmt,
+                        retries,
+                        cookies_browser,
+                        cookies_file,
+                    ),
                     daemon=True,
                     name=f"rec-{vid}",
                 )
@@ -334,24 +363,35 @@ def main():
         description="Monitors a YouTube channel and records live streams in multiple threads.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--channel-url",     required=True,
-                        help="YouTube channel URL")
-    parser.add_argument("--interval",        type=int, default=DEFAULT_CHECK_INTERVAL,
-                        help="Check interval [s]")
-    parser.add_argument("--output-dir",      default=DEFAULT_OUTPUT_DIR,
-                        help="Recording output directory")
-    parser.add_argument("--format",          default=DEFAULT_FORMAT,
-                        help="yt-dlp format")
-    parser.add_argument("--merge-format",    default=DEFAULT_MERGE_FORMAT,
-                        help="Output format: mkv | mp4 | ts")
-    parser.add_argument("--retries",         type=int, default=DEFAULT_RETRIES,
-                        help="Number of retry attempts for network errors")
-    parser.add_argument("--cookies-browser", default=None,
-                        help="firefox | chrome | edge | chromium")
-    parser.add_argument("--cookies-file",    default=None,
-                        help="Path to cookies.txt (Netscape format)")
-    parser.add_argument("--log-file",        default=None,
-                        help="Log file (optional)")
+    parser.add_argument("--channel-url", required=True, help="YouTube channel URL")
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_CHECK_INTERVAL,
+        help="Check interval [s]",
+    )
+    parser.add_argument(
+        "--output-dir", default=DEFAULT_OUTPUT_DIR, help="Recording output directory"
+    )
+    parser.add_argument("--format", default=DEFAULT_FORMAT, help="yt-dlp format")
+    parser.add_argument(
+        "--merge-format",
+        default=DEFAULT_MERGE_FORMAT,
+        help="Output format: mkv | mp4 | ts",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Number of retry attempts for network errors",
+    )
+    parser.add_argument(
+        "--cookies-browser", default=None, help="firefox | chrome | edge | chromium"
+    )
+    parser.add_argument(
+        "--cookies-file", default=None, help="Path to cookies.txt (Netscape format)"
+    )
+    parser.add_argument("--log-file", default=None, help="Log file (optional)")
     args = parser.parse_args()
 
     global log

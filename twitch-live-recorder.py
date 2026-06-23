@@ -9,7 +9,8 @@ Dependencies:
 Usage:
     python twitch-live-recorder.py --channels xqc,forsen --output-dir D:\\Recordings
 """
-from __future__ import annotations   # dict|None syntax on Python 3.9
+
+from __future__ import annotations  # dict|None syntax on Python 3.9
 
 import argparse
 import json
@@ -27,34 +28,35 @@ from pathlib import Path
 
 # ── DEFAULTS ──────────────────────────────────────────────────────────────────
 DEFAULT_CHECK_INTERVAL = 60
-DEFAULT_OUTPUT_DIR     = "recordings"
-DEFAULT_QUALITY        = "best"
-DEFAULT_RETRIES        = 5
+DEFAULT_OUTPUT_DIR = "recordings"
+DEFAULT_QUALITY = "best"
+DEFAULT_RETRIES = 5
 # ─────────────────────────────────────────────────────────────────────────────
 
 # channel_name → {"thread": Thread, "stop": Event}
 active_recordings: dict = {}
-active_lock  = threading.Lock()
-stop_event   = threading.Event()      # global shutdown signal
-log          = logging.getLogger("twitch-recorder")
+active_lock = threading.Lock()
+stop_event = threading.Event()  # global shutdown signal
+log = logging.getLogger("twitch-recorder")
 
 
 # ── LOGGER ────────────────────────────────────────────────────────────────────
 
+
 def setup_logger(log_file=None):
-    fmt       = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    logger    = logging.getLogger("twitch-recorder")
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    logger = logging.getLogger("twitch-recorder")
     logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()          # safe to call multiple times
+    logger.handlers.clear()  # safe to call multiple times
 
     console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.INFO)   # all INFO+ visible in terminal
+    console.setLevel(logging.INFO)  # all INFO+ visible in terminal
     console.setFormatter(fmt)
     logger.addHandler(console)
 
     if log_file:
         fh = logging.FileHandler(log_file, encoding="utf-8")
-        fh.setLevel(logging.INFO)    # _FileLogFilter does the real narrowing
+        fh.setLevel(logging.INFO)  # _FileLogFilter does the real narrowing
         fh.setFormatter(fmt)
         fh.addFilter(_FileLogFilter())
         logger.addHandler(fh)
@@ -69,11 +71,20 @@ class _FileLogFilter(logging.Filter):
     Routine poll noise (Checking / Offline / Already recording / Active recordings)
     is suppressed in the file but still visible in the console.
     """
+
     _KEEP = (
-        "[START]", "[DONE ]", "[STOP ]", "[CLEAN]", "[NEW  ]",
-        "[CHAT ] Saved", "[WARN ]",
-        "Ctrl+C", "stopping", "All threads", "All recordings",
-        "twitch-live-recorder",   # startup banner lines
+        "[START]",
+        "[DONE ]",
+        "[STOP ]",
+        "[CLEAN]",
+        "[NEW  ]",
+        "[CHAT ] Saved",
+        "[WARN ]",
+        "Ctrl+C",
+        "stopping",
+        "All threads",
+        "All recordings",
+        "twitch-live-recorder",  # startup banner lines
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -85,6 +96,7 @@ class _FileLogFilter(logging.Filter):
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 
+
 def sanitize_filename(name: str) -> str:
     """Remove characters that are illegal in Windows/Linux filenames."""
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
@@ -92,6 +104,7 @@ def sanitize_filename(name: str) -> str:
 
 
 # ── STREAM CHECK ──────────────────────────────────────────────────────────────
+
 
 def check_channel_live(channel: str) -> dict | None:
     """
@@ -109,9 +122,9 @@ def check_channel_live(channel: str) -> dict | None:
         data = json.loads(result.stdout)
         if not data.get("streams"):
             return None
-        meta  = data.get("metadata") or {}
+        meta = data.get("metadata") or {}
         title = meta.get("title") or channel
-        game  = meta.get("category") or ""
+        game = meta.get("category") or ""
         return {"channel": channel, "title": title, "game": game}
     except subprocess.TimeoutExpired:
         log.warning("[CHECK] Timeout checking channel: %s", channel)
@@ -124,6 +137,7 @@ def check_channel_live(channel: str) -> dict | None:
 
 # ── SRT WRITER ────────────────────────────────────────────────────────────────
 
+
 class SrtWriter:
     """
     Thread-safe SRT subtitle file writer.
@@ -132,18 +146,18 @@ class SrtWriter:
     """
 
     def __init__(self, path: Path, stream_start: datetime):
-        self._path   = path
-        self._start  = stream_start
-        self._index  = 1
-        self._lock   = threading.Lock()
-        self._fh     = open(path, "w", encoding="utf-8")
+        self._path = path
+        self._start = stream_start
+        self._index = 1
+        self._lock = threading.Lock()
+        self._fh = open(path, "w", encoding="utf-8")
 
     @staticmethod
     def _fmt(td: timedelta) -> str:
         total = max(0, int(td.total_seconds()))
         h, rem = divmod(total, 3600)
-        m, s   = divmod(rem, 60)
-        ms     = int(td.microseconds / 1000)
+        m, s = divmod(rem, 60)
+        ms = int(td.microseconds / 1000)
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
     def write(self, author: str, message: str, ts: datetime):
@@ -172,14 +186,15 @@ class SrtWriter:
 
 # ── CHAT CAPTURE (Twitch IRC, anonymous) ─────────────────────────────────────
 
+
 def capture_chat(channel: str, srt: SrtWriter, stop_ev: threading.Event):
     """
     Connects to Twitch IRC anonymously (no OAuth needed for public channels).
     Captures PRIVMSG messages and writes them to the SrtWriter in real time.
     Automatically reconnects on disconnect until stop_ev is set.
     """
-    server    = ("irc.chat.twitch.tv", 6667)
-    irc_chan  = f"#{channel.lower()}"
+    server = ("irc.chat.twitch.tv", 6667)
+    irc_chan = f"#{channel.lower()}"
 
     while not stop_ev.is_set():
         nick = f"McBot_{random.randint(10000, 99999)}"
@@ -191,7 +206,7 @@ def capture_chat(channel: str, srt: SrtWriter, stop_ev: threading.Event):
             sock.send(f"NICK {nick}\r\n".encode())
             sock.send(f"USER {nick} 8 * :{nick}\r\n".encode())
             sock.send(f"JOIN {irc_chan}\r\n".encode())
-            sock.setblocking(False)   # non-blocking — we poll via select()
+            sock.setblocking(False)  # non-blocking — we poll via select()
 
             log.info("[CHAT ] IRC connected: %s", irc_chan)
             last_recv = time.time()
@@ -229,8 +244,7 @@ def capture_chat(channel: str, srt: SrtWriter, stop_ev: threading.Event):
 
                         # :nick!user@host.tmi.twitch.tv PRIVMSG #channel :message
                         m = re.match(
-                            r":(\w+)!\w+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.+)",
-                            line
+                            r":(\w+)!\w+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.+)", line
                         )
                         if m:
                             srt.write(m.group(1), m.group(2).rstrip(), datetime.now())
@@ -257,6 +271,7 @@ def capture_chat(channel: str, srt: SrtWriter, stop_ev: threading.Event):
 
 # ── STREAM RECORDER ───────────────────────────────────────────────────────────
 
+
 def record_stream(
     channel: str,
     title: str,
@@ -274,18 +289,18 @@ def record_stream(
 
     Cleans itself out of active_recordings when done.
     """
-    stream_start  = datetime.now()
-    timestamp     = stream_start.strftime("%Y%m%d_%H%M%S")
-    safe_channel  = sanitize_filename(channel)
-    safe_title    = sanitize_filename(title)
+    stream_start = datetime.now()
+    timestamp = stream_start.strftime("%Y%m%d_%H%M%S")
+    safe_channel = sanitize_filename(channel)
+    safe_title = sanitize_filename(title)
 
     out_dir = Path(output_dir) / safe_channel
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name  = f"{timestamp}_{safe_channel}_{safe_title}"
+    base_name = f"{timestamp}_{safe_channel}_{safe_title}"
     video_path = out_dir / f"{base_name}.mkv"
-    chat_path  = out_dir / f"{base_name}_chat.srt"
-    meta_path  = out_dir / f"{base_name}_meta.txt"
+    chat_path = out_dir / f"{base_name}_chat.srt"
+    meta_path = out_dir / f"{base_name}_meta.txt"
 
     # Save stream metadata to a sidecar text file
     with open(meta_path, "w", encoding="utf-8") as mf:
@@ -302,8 +317,8 @@ def record_stream(
     log.info("        Chat  : %s", chat_path)
 
     # ── Chat capture (parallel thread) ───────────────────────────────────────
-    srt_writer  = SrtWriter(chat_path, stream_start)
-    chat_stop   = threading.Event()
+    srt_writer = SrtWriter(chat_path, stream_start)
+    chat_stop = threading.Event()
     chat_thread = threading.Thread(
         target=capture_chat,
         args=(channel, srt_writer, chat_stop),
@@ -319,9 +334,11 @@ def record_stream(
     cmd += [
         f"https://www.twitch.tv/{channel}",
         quality,
-        "--output",      str(video_path),
-        "--force",                          # overwrite if file exists
-        "--retry-open",  str(retries),      # retry stream open on transient errors
+        "--output",
+        str(video_path),
+        "--force",  # overwrite if file exists
+        "--retry-open",
+        str(retries),  # retry stream open on transient errors
         # NOTE: no --retry-streams here — if the stream ends, streamlink should
         # exit so our monitor loop can detect it and start a fresh recording.
     ]
@@ -333,14 +350,14 @@ def record_stream(
 
         # Poll until streamlink exits or we get a stop signal
         while proc.poll() is None:
-            if stop_ev.wait(2):   # wakes immediately when stop_ev is set
+            if stop_ev.wait(2):  # wakes immediately when stop_ev is set
                 log.info("[STOP ] Terminating streamlink for %s", channel)
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait()   # must wait after kill() to reap the process
+                    proc.wait()  # must wait after kill() to reap the process
                 break
 
         rc = proc.returncode if proc else -1
@@ -375,6 +392,7 @@ def record_stream(
 
 
 # ── MONITOR LOOP ──────────────────────────────────────────────────────────────
+
 
 def monitor_loop(
     channels: list,
@@ -450,27 +468,43 @@ def monitor_loop(
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Monitors Twitch channels and records streams + chat (SRT).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
-        "--channels", required=True,
+        "--channels",
+        required=True,
         help="Comma-separated Twitch channel names, e.g. xqc,forsen,streamer3",
     )
-    parser.add_argument("--output-dir",  default=DEFAULT_OUTPUT_DIR,
-                        help="Root recording directory")
-    parser.add_argument("--quality",     default=DEFAULT_QUALITY,
-                        help="streamlink quality: best | 1080p60 | 720p60 | worst")
-    parser.add_argument("--interval",    type=int, default=DEFAULT_CHECK_INTERVAL,
-                        help="Check interval between polls [seconds]")
-    parser.add_argument("--retries",     type=int, default=DEFAULT_RETRIES,
-                        help="Stream open retry attempts on transient errors")
-    parser.add_argument("--disable-ads", action="store_true",
-                        help="Pass --twitch-disable-ads to streamlink")
-    parser.add_argument("--log-file",    default=None,
-                        help="Optional log file path")
+    parser.add_argument(
+        "--output-dir", default=DEFAULT_OUTPUT_DIR, help="Root recording directory"
+    )
+    parser.add_argument(
+        "--quality",
+        default=DEFAULT_QUALITY,
+        help="streamlink quality: best | 1080p60 | 720p60 | worst",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_CHECK_INTERVAL,
+        help="Check interval between polls [seconds]",
+    )
+    parser.add_argument(
+        "--retries",
+        type=int,
+        default=DEFAULT_RETRIES,
+        help="Stream open retry attempts on transient errors",
+    )
+    parser.add_argument(
+        "--disable-ads",
+        action="store_true",
+        help="Pass --twitch-disable-ads to streamlink",
+    )
+    parser.add_argument("--log-file", default=None, help="Optional log file path")
     args = parser.parse_args()
 
     global log
