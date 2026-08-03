@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-twitch-live-recorder.py
-Monitors Twitch channels and records streams + live chat (SRT subtitles).
+kick-live-recorder.py
+Monitors Kick channels and records streams + live chat (SRT subtitles).
 
 Dependencies:
-    pip install streamlink
+    Checked and updated by start-kick-recorder.ps1
 
 Usage:
-    python twitch-live-recorder.py --channels ctsg,jellysketch,perrydotto,ninuschk --output-dir D:\\Recordings
+    python kick-live-recorder.py --channels ctsg,jellysketch,perrydotto,ninuschk --output-dir D:\\Recordings
 """
 
 from __future__ import annotations  # dict|None syntax on Python 3.9
@@ -15,16 +15,15 @@ from __future__ import annotations  # dict|None syntax on Python 3.9
 import argparse
 import json
 import logging
-import random
 import re
-import select
-import socket
 import subprocess
 import sys
 import threading
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+import requests
+import websocket
 
 # ── DEFAULTS ──────────────────────────────────────────────────────────────────
 DEFAULT_CHECK_INTERVAL = 60
@@ -37,7 +36,7 @@ DEFAULT_RETRIES = 5
 active_recordings: dict = {}
 active_lock = threading.Lock()
 stop_event = threading.Event()  # global shutdown signal
-log = logging.getLogger("twitch-recorder")
+log = logging.getLogger("kick-recorder")
 
 
 # ── LOGGER ────────────────────────────────────────────────────────────────────
@@ -45,7 +44,7 @@ log = logging.getLogger("twitch-recorder")
 
 def setup_logger(log_file=None):
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    logger = logging.getLogger("twitch-recorder")
+    logger = logging.getLogger("kick-recorder")
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()  # safe to call multiple times
 
@@ -84,7 +83,7 @@ class _FileLogFilter(logging.Filter):
         "stopping",
         "All threads",
         "All recordings",
-        "twitch-live-recorder",  # startup banner lines
+        "kick-live-recorder",  # startup banner lines
     )
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -109,11 +108,11 @@ def sanitize_filename(name: str) -> str:
 def check_channel_live(channel: str) -> dict | None:
     """
     Returns stream metadata dict if the channel is currently live, else None.
-    Uses: streamlink --json https://www.twitch.tv/{channel}
+    Uses: streamlink --json https://kick.com/{channel}
 
     Returns dict with keys: channel, title, game
     """
-    url = f"https://www.twitch.tv/{channel}"
+    url = f"https://kick.com/{channel}"
     cmd = ["streamlink", "--json", url]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
@@ -140,17 +139,29 @@ def check_channel_live(channel: str) -> dict | None:
 
 class SrtWriter:
     """
-    Thread-safe SRT subtitle file writer.
+    Thread-safe dual SRT subtitle writer.
+    Timecodes and indexes are identical in the plain and colored files.
     Timecodes are relative to stream_start, so they sync with the video file.
-    Display duration per message: 5 seconds (capped at next message if sooner).
+    Display duration per message: 5 seconds.
     """
 
-    def __init__(self, path: Path, stream_start: datetime):
-        self._path = path
+    BADGE_LABELS = {
+        "moderator": "[MOD]",
+        "vip": "[VIP]",
+        "og": "[OG]",
+        "subscriber": "[SUB]",
+        "founder": "[FND]",
+        "broadcaster": "[BC]",
+    }
+
+    def __init__(self, plain_path: Path, colored_path: Path, stream_start: datetime):
+        self._plain_path = plain_path
+        self._colored_path = colored_path
         self._start = stream_start
         self._index = 1
         self._lock = threading.Lock()
-        self._fh = open(path, "w", encoding="utf-8")
+        self._fh_plain = open(plain_path, "w", encoding="utf-8")
+        self._fh_colored = open(colored_path, "w", encoding="utf-8")
 
     @staticmethod
     def _fmt(td: timedelta) -> str:
@@ -160,95 +171,218 @@ class SrtWriter:
         ms = int(td.microseconds / 1000)
         return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
-    def write(self, author: str, message: str, ts: datetime):
+    def write(
+        self,
+        author: str,
+        message: str,
+        ts: datetime,
+        color: str | None = None,
+        badges: list | None = None,
+    ):
         t_start = ts - self._start
         if t_start.total_seconds() < 0:
             t_start = timedelta(0)
         t_end = t_start + timedelta(seconds=5)
 
-        block = (
-            f"{self._index}\n"
-            f"{self._fmt(t_start)} --> {self._fmt(t_end)}\n"
-            f"{author}: {message}\n\n"
+        safe_color = (
+            color if color and re.fullmatch(r"#[0-9A-Fa-f]{6}", color) else "#FFFFFF"
         )
+        badge_prefix = "".join(
+            self.BADGE_LABELS.get(str(badge).lower(), "") for badge in (badges or [])
+        )
+        if badge_prefix:
+            badge_prefix += " "
+
+        plain_text = f"{author}: {message}"
+        colored_text = (
+            f'{badge_prefix}<font color="{safe_color}">{author}</font>: {message}'
+        )
+
         with self._lock:
-            self._fh.write(block)
-            self._fh.flush()
+            header = f"{self._index}\n" f"{self._fmt(t_start)} --> {self._fmt(t_end)}\n"
+            self._fh_plain.write(f"{header}{plain_text}\n\n")
+            self._fh_colored.write(f"{header}{colored_text}\n\n")
+            self._fh_plain.flush()
+            self._fh_colored.flush()
             self._index += 1
 
     def close(self):
         with self._lock:
+            for fh in (self._fh_plain, self._fh_colored):
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
+
+# ── CHAT CAPTURE (Kick Pusher WebSocket, anonymous) ───────────────────────────
+
+
+class KickChatClient:
+    """Small anonymous client for Kick's public Pusher chat connection."""
+
+    CHATROOM_URL = "https://kick.com/api/v2/channels/{channel}/chatroom"
+    PUSHER_URL = (
+        "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679"
+        "?protocol=7&client=js&version=8.4.0-rc2&flash=false"
+    )
+    CHANNEL_PATTERN = "chatrooms.{chatroom_id}.v2"
+    USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/127.0.0.0 Safari/537.36"
+    )
+
+    def __init__(self, channel: str, stop_ev: threading.Event):
+        self.channel = channel
+        self.stop_ev = stop_ev
+        self.chatroom_id: int | None = None
+        self.ws = None
+
+    def resolve_chatroom_id(self) -> int | None:
+        """Retry until Kick returns a chatroom ID or shutdown is requested."""
+        url = self.CHATROOM_URL.format(channel=self.channel)
+        while not self.stop_ev.is_set():
             try:
-                self._fh.close()
+                response = requests.get(
+                    url,
+                    headers={
+                        "Accept": "application/json",
+                        "User-Agent": self.USER_AGENT,
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                chatroom_id = response.json().get("id")
+                if chatroom_id is None:
+                    raise ValueError("response does not contain chatroom id")
+                self.chatroom_id = int(chatroom_id)
+                return self.chatroom_id
+            except (
+                requests.RequestException,
+                ValueError,
+                TypeError,
+                json.JSONDecodeError,
+            ) as exc:
+                log.warning(
+                    "[CHAT ] Could not resolve chatroom for %s: %s",
+                    self.channel,
+                    exc,
+                )
+                if self.stop_ev.wait(5):
+                    break
+        return None
+
+    def connect(self):
+        if self.chatroom_id is None:
+            raise RuntimeError("chatroom_id has not been resolved")
+
+        self.ws = websocket.create_connection(
+            self.PUSHER_URL,
+            timeout=15,
+            origin="https://kick.com",
+        )
+        self.ws.settimeout(1)
+        subscription = {
+            "event": "pusher:subscribe",
+            "data": {
+                "auth": "",
+                "channel": self.CHANNEL_PATTERN.format(chatroom_id=self.chatroom_id),
+            },
+        }
+        self.ws.send(json.dumps(subscription))
+        return self.ws
+
+    def close(self):
+        if self.ws is not None:
+            try:
+                self.ws.close()
             except Exception:
                 pass
+            self.ws = None
 
 
-# ── CHAT CAPTURE (Twitch IRC, anonymous) ─────────────────────────────────────
+def _parse_kick_chat_message(payload: dict) -> dict | None:
+    """Map a Kick payload to the recorder's platform-neutral chat structure."""
+    sender = payload.get("sender") or {}
+    identity = sender.get("identity") or {}
+    author = sender.get("username")
+    message = payload.get("content")
+
+    if not author or message is None:
+        return None
+
+    badges = []
+    for badge in identity.get("badges") or []:
+        if isinstance(badge, dict) and badge.get("type"):
+            badges.append(str(badge["type"]).lower())
+
+    return {
+        "author": str(author),
+        "message": str(message),
+        "color": identity.get("color"),
+        "badges": badges,
+        "timestamp": datetime.now(),
+    }
 
 
-def capture_chat(channel: str, srt: SrtWriter, stop_ev: threading.Event):
+def capture_chat_kick(channel: str, srt: SrtWriter, stop_ev: threading.Event):
     """
-    Connects to Twitch IRC anonymously (no OAuth needed for public channels).
-    Captures PRIVMSG messages and writes them to the SrtWriter in real time.
+    Captures public Kick chat via Pusher and writes synchronized plain/colored SRT.
     Automatically reconnects on disconnect until stop_ev is set.
     """
-    server = ("irc.chat.twitch.tv", 6667)
-    irc_chan = f"#{channel.lower()}"
+    client = KickChatClient(channel, stop_ev)
+    if client.resolve_chatroom_id() is None:
+        log.info("[CHAT ] Thread stopped: %s", channel)
+        return
+
+    pusher_channel = client.CHANNEL_PATTERN.format(chatroom_id=client.chatroom_id)
 
     while not stop_ev.is_set():
-        nick = f"McBot_{random.randint(10000, 99999)}"
-        sock = None
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(15)
-            sock.connect(server)
-            sock.send(f"NICK {nick}\r\n".encode())
-            sock.send(f"USER {nick} 8 * :{nick}\r\n".encode())
-            sock.send(f"JOIN {irc_chan}\r\n".encode())
-            sock.setblocking(False)  # non-blocking — we poll via select()
-
-            log.info("[CHAT ] IRC connected: %s", irc_chan)
-            last_recv = time.time()
-            buf = ""
+            ws = client.connect()
+            log.info("[CHAT ] WS connected: %s", pusher_channel)
 
             while not stop_ev.is_set():
                 try:
-                    # 1-second select — unblocks quickly when stop_ev is set
-                    ready, _, _ = select.select([sock], [], [], 1.0)
-                    if not ready:
-                        # No data this second — send keepalive every 60s of silence
-                        if time.time() - last_recv > 60:
-                            sock.send(b"PING :tmi.twitch.tv\r\n")
-                            last_recv = time.time()
+                    raw = ws.recv()
+                    if not raw:
+                        break
+
+                    event = json.loads(raw)
+                    event_name = event.get("event")
+
+                    if event_name == "pusher:ping":
+                        ws.send(
+                            json.dumps(
+                                {"event": "pusher:pong", "data": event.get("data", {})}
+                            )
+                        )
                         continue
 
-                    chunk = sock.recv(4096).decode("utf-8", errors="replace")
-                    if not chunk:
-                        break
-                    last_recv = time.time()
-                    buf += chunk
+                    if event_name != r"App\Events\ChatMessageEvent":
+                        continue
 
-                    while "\r\n" in buf:
-                        line, buf = buf.split("\r\n", 1)
+                    payload = event.get("data")
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    if not isinstance(payload, dict):
+                        continue
 
-                        # Keepalive
-                        if line.startswith("PING"):
-                            sock.send(b"PONG :tmi.twitch.tv\r\n")
-                            continue
-
-                        # Strip IRCv3 tags (@key=val;... prefix) if Twitch sends them
-                        # without CAP REQ — older clients may still receive them
-                        if line.startswith("@"):
-                            line = re.sub(r"^@\S+ ", "", line)
-
-                        # :nick!user@host.tmi.twitch.tv PRIVMSG #channel :message
-                        m = re.match(
-                            r":(\w+)!\w+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.+)", line
+                    chat_message = _parse_kick_chat_message(payload)
+                    if chat_message:
+                        srt.write(
+                            chat_message["author"],
+                            chat_message["message"],
+                            chat_message["timestamp"],
+                            color=chat_message["color"],
+                            badges=chat_message["badges"],
                         )
-                        if m:
-                            srt.write(m.group(1), m.group(2).rstrip(), datetime.now())
 
+                except websocket.WebSocketTimeoutException:
+                    continue
+                except (json.JSONDecodeError, TypeError) as exc:
+                    log.debug("[CHAT ] Invalid event %s: %s", channel, exc)
                 except Exception as exc:
                     log.debug("[CHAT ] Recv error %s: %s", channel, exc)
                     break
@@ -256,14 +390,10 @@ def capture_chat(channel: str, srt: SrtWriter, stop_ev: threading.Event):
         except Exception as exc:
             log.warning("[CHAT ] Connection error %s: %s", channel, exc)
         finally:
-            if sock:
-                try:
-                    sock.close()
-                except Exception:
-                    pass
+            client.close()
 
         if not stop_ev.is_set():
-            log.info("[CHAT ] Reconnecting IRC %s in 5s...", irc_chan)
+            log.info("[CHAT ] Reconnecting WS %s in 5s...", pusher_channel)
             stop_ev.wait(5)
 
     log.info("[CHAT ] Thread stopped: %s", channel)
@@ -283,9 +413,9 @@ def record_stream(
     stop_ev: threading.Event,
 ):
     """
-    Runs in a dedicated thread. Records one Twitch stream:
+    Runs in a dedicated thread. Records one Kick stream:
       - streamlink → {timestamp}_{channel}_{title}.mkv
-      - Twitch IRC  → {timestamp}_{channel}_{title}_chat.srt
+      - Kick chat  → plain and colored {timestamp}_{channel}_{title}_chat*.srt
 
     Cleans itself out of active_recordings when done.
     """
@@ -300,6 +430,7 @@ def record_stream(
     base_name = f"{timestamp}_{safe_channel}_{safe_title}"
     video_path = out_dir / f"{base_name}.mkv"
     chat_path = out_dir / f"{base_name}_chat.srt"
+    chat_path_colored = out_dir / f"{base_name}_chat_colored.srt"
     meta_path = out_dir / f"{base_name}_meta.txt"
 
     # Save stream metadata to a sidecar text file
@@ -315,12 +446,13 @@ def record_stream(
     log.info("        Game  : %s", game)
     log.info("        Video : %s", video_path)
     log.info("        Chat  : %s", chat_path)
+    log.info("        Color : %s", chat_path_colored)
 
     # ── Chat capture (parallel thread) ───────────────────────────────────────
-    srt_writer = SrtWriter(chat_path, stream_start)
+    srt_writer = SrtWriter(chat_path, chat_path_colored, stream_start)
     chat_stop = threading.Event()
     chat_thread = threading.Thread(
-        target=capture_chat,
+        target=capture_chat_kick,
         args=(channel, srt_writer, chat_stop),
         daemon=True,
         name=f"chat-{channel}",
@@ -330,9 +462,9 @@ def record_stream(
     # ── streamlink command ───────────────────────────────────────────────────
     cmd = ["streamlink"]
     if disable_ads:
-        cmd += ["--twitch-disable-ads"]
+        log.warning("[WARN ] --disable-ads is ignored for Kick.")
     cmd += [
-        f"https://www.twitch.tv/{channel}",
+        f"https://kick.com/{channel}",
         quality,
         "--output",
         str(video_path),
@@ -383,7 +515,8 @@ def record_stream(
         except Exception:
             pass
 
-        log.info("[CHAT ] Saved: %s", chat_path)
+        log.info("[CHAT ] Saved plain: %s", chat_path)
+        log.info("[CHAT ] Saved colored: %s", chat_path_colored)
 
         with active_lock:
             active_recordings.pop(channel, None)
@@ -403,11 +536,11 @@ def monitor_loop(
     retries: int,
 ):
     log.info("=" * 60)
-    log.info("  twitch-live-recorder")
+    log.info("  kick-live-recorder")
     log.info("  Channels : %s", ", ".join(channels))
     log.info("  Output   : %s", output_dir)
     log.info("  Interval : %ds  Quality: %s", check_interval, quality)
-    log.info("  Ads skip : %s", disable_ads)
+    log.info("  Ads skip : unsupported on Kick (argument=%s)", disable_ads)
     log.info("  Press Ctrl+C to stop.")
     log.info("=" * 60)
 
@@ -471,13 +604,16 @@ def monitor_loop(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Monitors Twitch channels and records streams + chat (SRT).",
+        description=(
+            "Monitors Kick channels and records streams + chat "
+            "(plain and colored SRT)."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--channels",
         required=True,
-        help="Comma-separated Twitch channel names, e.g. xqc,forsen,streamer3",
+        help="Comma-separated Kick channel names, e.g. xqc,adinross,streamer3",
     )
     parser.add_argument(
         "--output-dir", default=DEFAULT_OUTPUT_DIR, help="Root recording directory"
@@ -502,7 +638,7 @@ def main():
     parser.add_argument(
         "--disable-ads",
         action="store_true",
-        help="Pass --twitch-disable-ads to streamlink",
+        help="Deprecated compatibility option; ignored for Kick",
     )
     parser.add_argument("--log-file", default=None, help="Optional log file path")
     args = parser.parse_args()
